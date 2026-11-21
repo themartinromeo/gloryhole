@@ -30,7 +30,7 @@ New links use a 22-character, randomly generated 128-bit private code with no ex
 
 Mounted network drives are supported, for example `/Volumes/Studio/Incoming`. Connect the share in Finder first and use a folder your Mac can write to. The app does not mount shares or store network credentials. If a destination disappears or changes during an upload, the receiver refuses to confirm delivery; it does not create a replacement folder or fall back to the original inbox. Network-drive performance and availability depend on that drive and connection.
 
-Incoming data is still staged on the Mac before being copied to the selected destination. Keep enough local free space for pending files, even when using a network drive. Large files may spend additional time in “Verifying & saving”; leave the sender page open until it says “Received”. Existing received files are not moved when the destination changes.
+Incoming data is staged on the Mac and checksummed as it arrives. When the destination is on the same drive as the Gloryhole folder, the finished file is moved into place instantly; on another drive or a network share it is copied, so large files may spend additional time in “Verifying & saving”. Keep enough local free space for pending files, even when using a network drive, and leave the sender page open until it says “Received”. Existing received files are not moved when the destination changes.
 
 The main controls and active transfers are arranged for a 16:9 laptop screen. Request and received-file history appear below the first screen; on phones, controls stack vertically.
 
@@ -58,7 +58,14 @@ Browser-to-Cloudflare traffic uses HTTPS; the connection helper creates an outbo
 
 Quick Tunnels are for testing and have no production availability guarantee. Their address changes each run; make fresh links after restarting. For ongoing use, configure a stable HTTPS tunnel/domain. See [Cloudflare Quick Tunnels](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/). Uploads use 8 MiB chunks to stay below [per-request upload limits](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/4xx-client-error/error-413/).
 
-The first version requires the Mac to be online. It does not queue files in cloud storage. Interrupted files are not shown as received; retry from the beginning. A lost confirmation can mean a file arrived despite a sender error, so check the receiver before retrying.
+The first version requires the Mac to be online. It does not queue files in cloud storage.
+
+## Interrupted uploads
+
+- **Network drops.** If the connection drops or stalls, the sender page shows “Reconnecting…”, asks the receiver how much it holds, and continues from there. It keeps trying for up to ten minutes. A chunk that was cut off partway is discarded by the receiver, so only complete chunks count.
+- **Lost confirmations.** If the “Received” confirmation is lost, the sender asks the receiver again and gets the original receipt. A file that arrived is no longer reported as failed.
+- **Closed or reloaded page.** Reopen the original link in the same browser within ten minutes. A **Continue where you left off** panel lists the unfinished files; choose the same files and the upload continues from the last confirmed byte. The receiver checks the most recent megabyte of the reselected file before continuing, so a different file can’t be attached by mistake. Files the sender doesn’t reselect are marked skipped in the report. **Discard** closes the old session.
+- Partial files are kept for ten minutes without activity, and are removed when the receiver restarts. After either, the file has to be sent again from the beginning.
 
 ## Protections and defaults
 

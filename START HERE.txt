@@ -13,6 +13,8 @@ For a Desktop shortcut, create a Finder alias to the launcher. Keep the original
 
 This clean package contains no received files, saved upload links, account credentials, or personal transfer reports. Your existing installation and its data are unchanged.
 
+Uploads now survive brief network drops, and a sender who closes or reloads the page can reopen the link within ten minutes to continue unfinished files.
+
 The public upload address changes when restarted. This is still the prototype; end-to-end encryption and cloud inbox storage have not been implemented.
 
 See README.md for usage and GOING-LIVE.md for the setup plan.

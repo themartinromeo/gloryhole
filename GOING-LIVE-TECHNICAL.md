@@ -52,7 +52,7 @@ I recommend:
 - Resumable multipart uploads with bounded parallelism. Tune concurrency and chunk size using measurements; do not launch unlimited parallel transfers. AWS documents parallel parts and independent retries as multipart-upload benefits. [Multipart uploads](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html).
 - A storage region and relay placement chosen from the actual locations of your senders and studio. Benchmark representative routes.
 - Streaming file data with bounded memory, background encryption/hash workers, and asynchronous report logging outside the main transfer path.
-- Avoiding unnecessary full-file copies and rereads. The current prototype stages files locally, reads them for hashing, then copies to the destination. That is reliable for a prototype but adds disk traffic and a final saving phase.
+- Avoiding unnecessary full-file copies and rereads. The current prototype stages files locally and hashes them as they arrive. On the same volume it moves them into place with a hard link; for another drive or network share it still copies, which adds disk traffic and a final saving phase.
 - Clear measurements of network transfer time, verification time, destination-writing time, retries, and confirmed delivery. A fast-looking browser progress bar is not a confirmed file save.
 
 An optional later optimization is direct WebRTC transfer when both ends are online, with relay/storage fallback. Direct connectivity is not always possible; TURN relay infrastructure is needed for some networks, and relaying can affect cost and speed. [WebRTC connection setup](https://webrtc.org/getting-started/peer-connections), [TURN servers](https://webrtc.org/getting-started/turn-server).

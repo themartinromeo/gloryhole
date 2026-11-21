@@ -23,3 +23,5 @@ progress::-webkit-progress-bar{background:#555}progress::-webkit-progress-value{
 .receiver-panel .folder-choice:disabled:hover{background:#111;color:#fff}
 .receiver-panel .folder-description strong{color:#fff}
 .receiver-panel .folder-path,.receiver-panel .fine,.receiver-panel .muted,.receiver-panel .manual-location summary{color:#c6c6c6}
+
+.resume{width:100%;text-align:left;padding:16px 18px;background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--text);margin:10px 0}.resume[hidden]{display:none}.resume h2{margin-bottom:6px}.resume .fine{margin-bottom:12px}
