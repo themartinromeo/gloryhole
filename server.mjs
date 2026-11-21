@@ -16,6 +16,9 @@ const digest = value => crypto.createHash('sha256').update(value).digest('hex');
 const random = () => crypto.randomBytes(32).toString('base64url');
 const equal = (a, b) => typeof a === 'string' && typeof b === 'string' && Buffer.byteLength(a) === Buffer.byteLength(b) && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
 const fail = (status, message) => Object.assign(new Error(message), {status});
+// A retryable error tells the sender to wait, ask for the upload's status, and continue from the receiver's byte count.
+const retryLater = (message, status = 409) => Object.assign(fail(status, message), {retry: true});
+const FINISHED_RETENTION = 60 * 60000;
 
 export async function startInbox(options = {}) {
   const root = path.resolve(options.root || process.env.INBOX_DATA || path.join(here, 'data'));
@@ -62,6 +65,9 @@ export async function startInbox(options = {}) {
   const adminSecret = options.adminSecret || random();
   const sessionSecret = random();
   const active = new Map();
+  // Confirmed uploads are remembered briefly so a sender whose confirmation was lost can still learn the result.
+  const finished = new Map();
+  const stagingDevice = fs.statSync(staging).dev;
   const reports = new ReportStore(stateDir, destinationInfo);
   const discard = (item, status = 'cancelled', reason = 'The upload was cancelled.') => {
     item.cancelled = true;
@@ -71,6 +77,7 @@ export async function startInbox(options = {}) {
   };
   const janitor = setInterval(() => {
     for (const item of active.values()) if (item.record.revoked || Date.now() >= item.record.expiresAt || (!item.busy && Date.now() - item.touched > 10 * 60000)) discard(item, 'interrupted', 'The link expired, was closed, or the sender disconnected.');
+    for (const [id, entry] of finished) if (Date.now() - entry.receipt.receivedAt > FINISHED_RETENTION) finished.delete(id);
     reports.sweep(new Set([...active.values()].map(item => item.report?.id).filter(Boolean)));
   }, 15000);
   janitor.unref();
@@ -121,14 +128,14 @@ export async function startInbox(options = {}) {
       if (closing) throw fail(503, 'Receiver is stopping.');
       await handler(req, res);
     } catch (err) {
-      if (req.reportContext) {
+      if (req.reportContext && !req.resumable) {
         const {report, fileId} = req.reportContext;
         const file = report.files.find(item => item.id === fileId);
         if (file && file.status !== 'cancelled' && file.status !== 'interrupted') {
           try {reports.update(report, fileId, {status: 'failed', error: err.status ? err.message : 'The receiver could not confirm this file.', endedAt: Date.now()});} catch {}
         }
       }
-      if (!res.headersSent && !res.destroyed) json(res, err.status || 500, {error: err.status ? err.message : 'The receiver could not complete this request.'});
+      if (!res.headersSent && !res.destroyed) json(res, err.status || 500, {error: err.status ? err.message : 'The receiver could not complete this request.', ...(err.retry ? {retry: true} : {})});
       else if (!res.destroyed) res.destroy();
       if (!err.status && err.code !== 'ECONNRESET' && err.code !== 'ERR_STREAM_PREMATURE_CLOSE') console.error('Receiver error:', err.message);
     }
@@ -270,70 +277,125 @@ export async function startInbox(options = {}) {
       label: record.label, expiresAt: record.expiresAt, maxFileBytes: record.maxFileBytes,
       remainingBytes: Math.max(0, record.maxBytes - record.receivedBytes), remainingFiles: record.maxFiles - record.receivedFiles
     });
+    const sameReport = item => !item.report || (req.reportContext && req.reportContext.report === item.report && req.reportContext.fileId === item.reportFileId);
+    const statusRoute = url.pathname.match(/^\/api\/uploads\/([a-f0-9-]{36})$/);
+    if (req.method === 'GET' && statusRoute) {
+      // Status checks never change the report: they are how a sender recovers after a dropped connection.
+      req.resumable = true;
+      const done = finished.get(statusRoute[1]);
+      if (done && done.record === record) {
+        if (!sameReport(done)) throw fail(403, 'This file belongs to a different report session.');
+        return json(res, 200, {id: statusRoute[1], completed: true, ...done.response});
+      }
+      const item = active.get(statusRoute[1]);
+      if (!item || item.record !== record || item.cancelled) throw fail(404, 'Upload not found. Start the file again.');
+      if (!sameReport(item)) throw fail(403, 'This file belongs to a different report session.');
+      item.touched = Date.now();
+      return json(res, 200, {id: item.id, completed: false, bytes: item.bytes, size: item.length, busy: item.busy, phase: item.phase || 'receiving', chunkBytes: 8 * 1024 ** 2});
+    }
     if (req.method !== 'POST') throw fail(404, 'Not found.');
     if (url.pathname !== '/api/uploads') {
-      const match = url.pathname.match(/^\/api\/uploads\/([a-f0-9-]+)\/(chunk|finish|cancel)$/);
+      const match = url.pathname.match(/^\/api\/uploads\/([a-f0-9-]+)\/(chunk|finish|cancel|resume)$/);
       if (!match) throw fail(404, 'Not found.');
+      const done = finished.get(match[1]);
+      if (done && done.record === record && match[2] !== 'chunk') {
+        // Repeating a finish (or a cancel) after confirmation returns the original receipt instead of an error.
+        if (!sameReport(done)) throw fail(403, 'This file belongs to a different report session.');
+        await body(req);
+        return json(res, match[2] === 'finish' ? 201 : 200, match[2] === 'finish' ? done.response : {ok: true, completed: true});
+      }
       const item = active.get(match[1]);
       if (!item || item.record !== record || item.cancelled) throw fail(404, 'Upload not found. Start the file again.');
-      if (item.report) {
-        if (!req.reportContext || req.reportContext.report !== item.report || req.reportContext.fileId !== item.reportFileId) throw fail(403, 'This file belongs to a different report session.');
-      }
+      if (!sameReport(item)) throw fail(403, 'This file belongs to a different report session.');
       if (match[2] === 'cancel') {await body(req); discard(item); return json(res, 200, {ok: true});}
-      if (item.busy) throw fail(409, 'This upload already has a request in progress.');
+      if (match[2] !== 'finish') req.resumable = true;
+      if (item.busy) {
+        // A new chunk or resume request from the same sender replaces a stalled one (for example, a half-open
+        // connection after a network change). The old request is aborted and its partial chunk rolled back first.
+        if (match[2] === 'finish' || item.phase === 'saving' || !item.req) throw retryLater('This upload already has a request in progress.');
+        item.req.destroy();
+        await item.idle;
+        if (item.cancelled || !active.has(item.id)) throw fail(404, 'Upload not found. Start the file again.');
+        if (item.busy) throw retryLater('This upload already has a request in progress.');
+      }
       item.busy = true; item.req = req; item.touched = Date.now();
+      item.idle = new Promise(resolve => {item.release = resolve;});
       try {
+        if (match[2] === 'resume') {
+          // The sender proves it reselected the same file by hashing the bytes just before the receiver's offset.
+          const {sha256, length} = await body(req);
+          const sample = Math.min(item.bytes, 1024 ** 2);
+          if (length !== sample || typeof sha256 !== 'string') throw fail(400, 'Invalid resume check.');
+          const handle = await fs.promises.open(item.temporary, 'r');
+          let tail;
+          try {
+            tail = Buffer.alloc(sample);
+            const {bytesRead} = await handle.read(tail, 0, sample, item.bytes - sample);
+            if (bytesRead !== sample) throw fail(409, 'The partial file is incomplete. Start the file again.');
+          } finally {await handle.close();}
+          if (digest(tail) !== sha256) throw fail(409, 'This is not the same file that was being sent. Choose the original file, or start again.');
+          return json(res, 200, {id: item.id, bytes: item.bytes, chunkBytes: 8 * 1024 ** 2});
+        }
         if (match[2] === 'chunk') {
           const length = Number(req.headers['content-length']);
           const offset = Number(req.headers['x-upload-offset']);
           if (!Number.isSafeInteger(length) || length <= 0 || length > 8 * 1024 ** 2) throw fail(413, 'Chunk must be between 1 byte and 8 MB.');
-          if (!Number.isSafeInteger(offset) || offset !== item.bytes) throw fail(409, 'Upload offset mismatch. Start the file again.');
+          if (!Number.isSafeInteger(offset) || offset !== item.bytes) throw retryLater('Upload offset mismatch. Check the upload status and continue from the receiver’s byte count.');
           if (item.bytes + length > item.length) throw fail(413, 'Chunk exceeds the declared file size.');
           let received = 0;
+          // Hash while receiving, on a copy, so a failed chunk can be rolled back without rereading the file.
+          const hash = item.hash.copy();
           const meter = new Transform({transform(chunk, encoding, callback) {
             received += chunk.length;
             item.inflight = received; item.rate.sample(item.bytes + received);
             if (item.cancelled || record.revoked || Date.now() >= record.expiresAt) return callback(fail(410, 'Upload link is closed.'));
             if (received > length) return callback(fail(413, 'Chunk too large.'));
+            hash.update(chunk);
             callback(null, chunk);
           }});
           try {
             await pipeline(req, meter, fs.createWriteStream(item.temporary, {flags: 'r+', start: item.bytes}));
             if (received !== length) throw fail(400, 'Incomplete chunk.');
           } catch (err) {item.inflight = 0; item.rate.sample(item.bytes); fs.truncateSync(item.temporary, item.bytes); throw err;}
-          item.bytes += received; item.inflight = 0;
+          item.bytes += received; item.inflight = 0; item.hash = hash;
           if (item.report) reports.update(item.report, item.reportFileId, {bytes: item.bytes});
           return json(res, 200, {bytes: item.bytes});
         }
         await body(req);
         if (item.bytes !== item.length) throw fail(409, 'The file is not fully uploaded yet.');
         item.phase = 'saving';
-        const hash = crypto.createHash('sha256');
-        for await (const chunk of fs.createReadStream(item.temporary)) {
-          if (item.cancelled || record.revoked || Date.now() >= record.expiresAt) throw fail(410, 'Upload link is closed.');
-          hash.update(chunk);
-        }
+        const sha256 = item.hash.copy().digest('hex');
         if (item.cancelled || record.revoked || Date.now() >= record.expiresAt) throw fail(410, 'Upload link is closed.');
         const currentFolder = destinationInfo(item.folder);
         if (currentFolder.device !== item.device || currentFolder.inode !== item.inode) throw fail(409, 'The destination drive changed during this upload. Reconnect it and try again.');
         const destination = path.join(item.folder, item.storedName);
-        // COPYFILE_EXCL works across volumes and on SMB shares, without replacing existing files.
         let created = false;
         try {
-          await fs.promises.copyFile(item.temporary, destination, fs.constants.COPYFILE_EXCL);
+          // On the same volume, a hard link puts the file in place instantly and, like COPYFILE_EXCL, never replaces
+          // an existing file. Otherwise (other drives, SMB shares, or file systems without links) copy it.
+          let linked = false;
+          if (item.device === stagingDevice) {
+            try {await fs.promises.link(item.temporary, destination); linked = true;}
+            catch (err) {if (err.code === 'EEXIST') throw err;}
+          }
+          if (!linked) await fs.promises.copyFile(item.temporary, destination, fs.constants.COPYFILE_EXCL);
           created = true;
           const after = destinationInfo(item.folder);
           if (after.device !== item.device || after.inode !== item.inode) throw fail(409, 'The destination changed while saving.');
           if (item.cancelled || record.revoked || Date.now() >= record.expiresAt) throw fail(410, 'Upload link is closed.');
         } catch (err) {if (created) fs.rmSync(destination, {force: true}); throw err;}
-        const receipt = {id: item.id, requestId: record.id, name: item.name, storedName: item.storedName, folder: item.folder, bytes: item.bytes, sha256: hash.digest('hex'), receivedAt: Date.now()};
+        const receipt = {id: item.id, requestId: record.id, name: item.name, storedName: item.storedName, folder: item.folder, bytes: item.bytes, sha256, receivedAt: Date.now()};
         record.receivedBytes += item.bytes; record.receivedFiles++; state.receipts.push(receipt);
         try {persist();} catch (err) {record.receivedBytes -= item.bytes; record.receivedFiles--; state.receipts.pop(); fs.unlinkSync(destination); throw err;}
         if (item.report) reports.update(item.report, item.reportFileId, {status: 'completed', bytes: item.bytes, sha256: receipt.sha256, endedAt: Date.now(), error: null});
+        const response = {ok: true, name: item.name, bytes: item.bytes, sha256: receipt.sha256};
+        finished.set(item.id, {record, report: item.report, reportFileId: item.reportFileId, receipt, response});
         active.delete(item.id); fs.rmSync(item.temporary, {force: true});
-        return json(res, 201, {ok: true, name: item.name, bytes: item.bytes, sha256: receipt.sha256});
+        return json(res, 201, response);
       } finally {
         item.busy = false; item.req = null; item.touched = Date.now();
+        if (item.phase === 'saving' && active.has(item.id)) item.phase = 'receiving';
+        item.release();
         if (item.cancelled) discard(item);
       }
     }
@@ -370,7 +432,7 @@ export async function startInbox(options = {}) {
     const temporary = path.join(staging, `${id}.part`);
     const storedName = `${id}--${name}`;
     fs.closeSync(fs.openSync(temporary, 'wx', 0o600));
-    active.set(id, {id, record, length, name, storedName, temporary, ...selected, report: req.reportContext?.report, reportFileId: req.reportContext?.fileId, rate: new TransferRate(), bytes: 0, touched: Date.now(), busy: false, req: null, cancelled: false});
+    active.set(id, {id, record, length, name, storedName, temporary, ...selected, report: req.reportContext?.report, reportFileId: req.reportContext?.fileId, rate: new TransferRate(), hash: crypto.createHash('sha256'), bytes: 0, touched: Date.now(), busy: false, req: null, cancelled: false});
     if (req.reportContext) reports.update(req.reportContext.report, req.reportContext.fileId, {status: 'sending', startedAt: Date.now(), bytes: 0, error: null});
     json(res, 201, {id, chunkBytes: 8 * 1024 ** 2});
   }));

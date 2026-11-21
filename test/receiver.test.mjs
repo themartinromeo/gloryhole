@@ -345,3 +345,100 @@ test('receiver restart and abandoned sessions produce interrupted reports rather
     assert.equal(recovered.authenticate(idle.id, idle.key).files[0].status, 'interrupted');
   } finally {fs.rmSync(root, {recursive: true, force: true});}
 });
+
+const sha = value => crypto.createHash('sha256').update(value).digest('hex');
+// Sends part of a chunk over a raw connection; `drop` destroys it, otherwise it stays open (a stalled sender).
+function partialChunk(app, token, id, offset, declared, data, headers = {}, drop = true) {
+  const req = http.request(`${app.uploadOrigin}/api/uploads/${id}/chunk`, {method: 'POST', headers: {Authorization: `Bearer ${token}`, 'Content-Type': 'application/octet-stream', 'Content-Length': declared, 'X-Upload-Offset': String(offset), ...headers}});
+  req.on('error', () => {});
+  req.write(data);
+  if (drop) setTimeout(() => req.destroy(), 50);
+  return req;
+}
+async function settled(sender, token, id, headers) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const status = await (await sender(token, `/api/uploads/${id}`, undefined, headers)).json();
+    if (!status.busy) return status;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  throw Error('upload stayed busy');
+}
+
+test('a dropped chunk is rolled back without failing the report, and the sender continues from the receiver’s byte count', async t => {
+  const {app, root, create, sender} = await fixture(t);
+  const link = await create();
+  const bytes = crypto.randomBytes(300000);
+  const fileId = crypto.randomUUID();
+  const batch = await (await sender(link.token, '/api/batches', {sender: 'Resumer', files: [{id: fileId, name: 'clip.mov', size: bytes.length}]})).json();
+  const headers = {'X-Report-Id': batch.id, 'X-Report-Token': batch.key, 'X-Report-File': fileId};
+  const {id} = await (await sender(link.token, '/api/uploads', {name: 'clip.mov', size: bytes.length}, headers)).json();
+  assert.equal((await sender(link.token, `/api/uploads/${id}/chunk`, bytes.subarray(0, 100000), {...headers, 'Content-Type': 'application/octet-stream', 'X-Upload-Offset': '0'})).status, 200);
+  partialChunk(app, link.token, id, 100000, 100000, bytes.subarray(100000, 150000), headers);
+  const status = await settled(sender, link.token, id, headers);
+  assert.equal(status.bytes, 100000); assert.equal(status.completed, false); assert.equal(status.size, bytes.length);
+  const report = await (await sender(link.token, `/api/reports/${batch.id}`, undefined, {'X-Report-Token': batch.key})).json();
+  assert.equal(report.files[0].status, 'sending');
+  // A retry at a stale offset is flagged as retryable so the sender knows to resynchronise.
+  const stale = await sender(link.token, `/api/uploads/${id}/chunk`, bytes.subarray(0, 10), {...headers, 'Content-Type': 'application/octet-stream', 'X-Upload-Offset': '0'});
+  assert.equal(stale.status, 409); assert.equal((await stale.json()).retry, true);
+  for (let offset = status.bytes; offset < bytes.length; offset += 100000) {
+    assert.equal((await sender(link.token, `/api/uploads/${id}/chunk`, bytes.subarray(offset, offset + 100000), {...headers, 'Content-Type': 'application/octet-stream', 'X-Upload-Offset': String(offset)})).status, 200);
+  }
+  const receipt = await (await sender(link.token, `/api/uploads/${id}/finish`, {}, headers)).json();
+  assert.equal(receipt.sha256, sha(bytes));
+  const [stored] = fs.readdirSync(path.join(root, 'Received')).filter(name => name.endsWith('clip.mov'));
+  assert.deepEqual(fs.readFileSync(path.join(root, 'Received', stored)), bytes);
+  assert.equal(fs.statSync(path.join(root, 'Received', stored)).nlink, 1);
+  assert.deepEqual(fs.readdirSync(path.join(root, '.partial')), []);
+});
+
+test('a new chunk request replaces a stalled one at the same offset', async t => {
+  const {app, create, sender} = await fixture(t);
+  const link = await create();
+  const bytes = crypto.randomBytes(120000);
+  const {id} = await (await sender(link.token, '/api/uploads', {name: 'stall.bin', size: bytes.length})).json();
+  const stalled = partialChunk(app, link.token, id, 0, bytes.length, bytes.subarray(0, 40000), {}, false);
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal((await (await sender(link.token, `/api/uploads/${id}`)).json()).busy, true);
+  const retry = await sender(link.token, `/api/uploads/${id}/chunk`, bytes, {'Content-Type': 'application/octet-stream', 'X-Upload-Offset': '0'});
+  assert.equal(retry.status, 200);
+  assert.equal((await retry.json()).bytes, bytes.length);
+  stalled.destroy();
+  const receipt = await (await sender(link.token, `/api/uploads/${id}/finish`, {})).json();
+  assert.equal(receipt.sha256, sha(bytes));
+});
+
+test('finish is idempotent: a lost confirmation can be recovered from status or by finishing again', async t => {
+  const {root, create, sender} = await fixture(t);
+  const link = await create();
+  const bytes = crypto.randomBytes(5000);
+  const {id} = await (await sender(link.token, '/api/uploads', {name: 'twice.txt', size: bytes.length})).json();
+  await sender(link.token, `/api/uploads/${id}/chunk`, bytes, {'Content-Type': 'application/octet-stream', 'X-Upload-Offset': '0'});
+  const first = await (await sender(link.token, `/api/uploads/${id}/finish`, {})).json();
+  const again = await sender(link.token, `/api/uploads/${id}/finish`, {});
+  assert.equal(again.status, 201); assert.deepEqual(await again.json(), first);
+  const status = await (await sender(link.token, `/api/uploads/${id}`)).json();
+  assert.equal(status.completed, true); assert.equal(status.sha256, sha(bytes));
+  assert.equal((await sender(link.token, `/api/uploads/${id}/cancel`, {})).status, 200);
+  assert.equal(fs.readdirSync(path.join(root, 'Received')).length, 1);
+  const other = await create();
+  assert.equal((await sender(other.token, `/api/uploads/${id}`)).status, 404);
+  assert.equal((await sender(other.token, `/api/uploads/${id}/finish`, {})).status, 404);
+});
+
+test('resuming requires proof that the sender reselected the same file', async t => {
+  const {create, sender} = await fixture(t);
+  const link = await create();
+  const bytes = crypto.randomBytes(3 * 1024 ** 2);
+  const {id} = await (await sender(link.token, '/api/uploads', {name: 'resume.mov', size: bytes.length})).json();
+  const offset = 2 * 1024 ** 2;
+  await sender(link.token, `/api/uploads/${id}/chunk`, bytes.subarray(0, offset), {'Content-Type': 'application/octet-stream', 'X-Upload-Offset': '0'});
+  const sample = 1024 ** 2;
+  const wrong = await sender(link.token, `/api/uploads/${id}/resume`, {length: sample, sha256: sha(crypto.randomBytes(sample))});
+  assert.equal(wrong.status, 409); assert.equal((await wrong.json()).retry, undefined);
+  assert.equal((await sender(link.token, `/api/uploads/${id}/resume`, {length: 5, sha256: 'x'})).status, 400);
+  const right = await sender(link.token, `/api/uploads/${id}/resume`, {length: sample, sha256: sha(bytes.subarray(offset - sample, offset))});
+  assert.equal(right.status, 200); assert.equal((await right.json()).bytes, offset);
+  await sender(link.token, `/api/uploads/${id}/chunk`, bytes.subarray(offset), {'Content-Type': 'application/octet-stream', 'X-Upload-Offset': String(offset)});
+  assert.equal((await (await sender(link.token, `/api/uploads/${id}/finish`, {})).json()).sha256, sha(bytes));
+});
