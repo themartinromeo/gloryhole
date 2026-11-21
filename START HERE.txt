@@ -1,0 +1,18 @@
+WOOKEY FILMS — GLORYHOLE
+Latest build packaged November 21, 2026
+
+1. Extract the ZIP and keep the entire Gloryhole folder together.
+2. Double-click Open Gloryhole.command inside that folder.
+3. Keep the Terminal window open while receiving files.
+
+The launcher uses Node.js 22 or newer from your computer, or the Node runtime bundled with Codex when available. If neither is installed, install Node.js from https://nodejs.org and reopen the launcher.
+
+On first launch, setup downloads the connection helper from Cloudflare's official GitHub release and checks its published SHA-256 digest. Internet access is required.
+
+For a Desktop shortcut, create a Finder alias to the launcher. Keep the original launcher inside the Gloryhole folder.
+
+This clean package contains no received files, saved upload links, account credentials, or personal transfer reports. Your existing installation and its data are unchanged.
+
+The public upload address changes when restarted. This is still the prototype; end-to-end encryption and cloud inbox storage have not been implemented.
+
+See README.md for usage and GOING-LIVE.md for the setup plan.

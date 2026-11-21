@@ -1,0 +1,19 @@
+// Native macOS directory chooser. No Finder automation or shell interpolation is needed.
+function run(argv) {
+  ObjC.import('AppKit');
+  ObjC.import('Foundation');
+  const app = $.NSApplication.sharedApplication;
+  app.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
+  const panel = $.NSOpenPanel.openPanel;
+  panel.title = 'Wookey Films — Receive files here';
+  panel.message = 'Choose a folder on your Mac or a connected network drive.';
+  panel.prompt = 'Receive here';
+  panel.canChooseFiles = false;
+  panel.canChooseDirectories = true;
+  panel.allowsMultipleSelection = false;
+  panel.canCreateDirectories = true;
+  if (argv[0]) panel.directoryURL = $.NSURL.fileURLWithPath(argv[0]);
+  app.activateIgnoringOtherApps(true);
+  if (Number(panel.runModal) !== 1) return '';
+  return ObjC.unwrap(panel.URL.path);
+}
